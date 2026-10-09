@@ -1,0 +1,99 @@
+name: docker
+
+on:
+  push:
+    branches:
+      - main
+  # Build and test only, no publishing. Covers Dependabot's Alpine updates.
+  pull_request:
+  workflow_dispatch:
+  # Weekly rebuild, so Alpine's fixes (OpenSSL, musl, openvpn itself) get published without a
+  # commit. It only publishes when a package changed since the last published build.
+  schedule:
+    - cron: "23 4 * * 1"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build for the runner's arch first, to read what actually got installed.
+      - name: Build probe image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: local/openvpn:probe
+      - name: Read the OpenVPN version
+        id: version
+        run: |
+          docker run --rm local/openvpn:probe apk list -I 2>/dev/null
+          full=$(docker run --rm local/openvpn:probe sh -c 'openvpn --version | head -1' | cut -d' ' -f2)
+          echo "OpenVPN $full"
+          [[ $full =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected version string: '$full'"; exit 1; }
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "minor=${full%.*}" >> "$GITHUB_OUTPUT"
+      # The reason this image exists: nothing gets published that a MikroTik can't connect to.
+      - name: Test with a RouterOS-like client
+        run: test/routeros.sh local/openvpn:probe
+      - name: Compare with the published image
+        id: changed
+        if: github.event_name == 'schedule'
+        run: |
+          pkgs() { docker run --rm "$1" apk list -I 2>/dev/null | sort; }
+          if [ "$(pkgs local/openvpn:probe)" = "$(pkgs "$REGISTRY/$IMAGE_NAME:latest")" ]; then
+            echo "Same packages as :latest, nothing to publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        if: steps.changed.outputs.skip != 'true'
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.version.outputs.minor }}
+            type=raw,value=${{ steps.version.outputs.full }}
+            type=raw,value=${{ steps.version.outputs.full }}-${{ github.run_number }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.full }}
+      - name: Build and push Docker image
+        id: push
+        if: steps.changed.outputs.skip != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Generate artifact attestation
+        if: github.event_name != 'pull_request' && steps.changed.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
