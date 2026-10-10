@@ -5,8 +5,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-  # Proposes new Alpine releases. Their PRs run test/routeros.sh against the pinned openvpn~2.7,
-  # so a release without OpenVPN 2.7, or one that breaks MikroTik clients, fails its checks.
+  # Proposes new Alpine releases. Their PRs run test/routeros.sh against the pinned openvpn~2.6,
+  # so a release without OpenVPN 2.6, or one that breaks MikroTik clients, fails its checks.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
